@@ -5,13 +5,129 @@ const { authenticateToken } = require("../middleware/auth");
 const { encrypt, generateKey, hashData } = require("../services/encryption");
 const { uploadToIPFS, retrieveFromIPFS } = require("../services/ipfs");
 const { createTopic, submitMessage } = require("../config/hedera");
+const supabase = require("../config/supabase");
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB
 
-// In-memory patient store (use PostgreSQL in production)
-const patients = new Map();
-const records = new Map();
+// In-memory fallback stores (used when Supabase is not configured)
+const patientsMap = new Map();
+const recordsMap = new Map();
+
+// ── Helper: Supabase or Map ──
+
+async function getPatient(walletAddress) {
+  const key = walletAddress.toLowerCase();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from("patients")
+      .select("*")
+      .eq("wallet_address", key)
+      .single();
+    if (error || !data) return null;
+    // Map DB row to app shape
+    return {
+      id: data.id,
+      walletAddress: data.wallet_address,
+      name: data.name,
+      did: data.did,
+      hcsTopicId: data.hcs_topic_id,
+      encryptionKey: data.encryption_key,
+      records: [], // records are fetched separately
+      earnings: parseFloat(data.earnings) || 0,
+      registeredAt: data.registered_at,
+    };
+  }
+  return patientsMap.get(key) || null;
+}
+
+async function upsertPatient(patient) {
+  const key = patient.walletAddress.toLowerCase();
+  if (supabase) {
+    const { error } = await supabase.from("patients").upsert({
+      id: patient.id,
+      wallet_address: key,
+      name: patient.name,
+      did: patient.did,
+      hcs_topic_id: patient.hcsTopicId,
+      encryption_key: patient.encryptionKey,
+      earnings: patient.earnings || 0,
+    }, { onConflict: "wallet_address" });
+    if (error) throw new Error(`Supabase patient upsert failed: ${error.message}`);
+  } else {
+    patientsMap.set(key, patient);
+  }
+}
+
+async function getRecord(recordId) {
+  if (supabase) {
+    const { data, error } = await supabase
+      .from("records")
+      .select("*")
+      .eq("id", recordId)
+      .single();
+    if (error || !data) return null;
+    return mapRecordRow(data);
+  }
+  return recordsMap.get(recordId) || null;
+}
+
+async function insertRecord(record) {
+  if (supabase) {
+    const { error } = await supabase.from("records").insert({
+      id: record.id,
+      patient_wallet: record.patientWallet,
+      file_name: record.fileName,
+      document_type: record.documentType,
+      ipfs_cid: record.ipfsCid,
+      document_hash: record.documentHash,
+      hcs_topic_id: record.hcsTopicId,
+      hcs_sequence_number: record.hcsSequenceNumber?.toString() || null,
+      verification_status: record.verificationStatus || "unverified",
+      verified_by: record.verifiedBy || null,
+      is_listed: record.isListed || false,
+      listing_price: record.listingPrice || 0,
+    });
+    if (error) throw new Error(`Supabase record insert failed: ${error.message}`);
+  } else {
+    recordsMap.set(record.id, record);
+  }
+}
+
+async function getPatientRecordsFromDB(walletAddress) {
+  const key = walletAddress.toLowerCase();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from("records")
+      .select("*")
+      .eq("patient_wallet", key)
+      .order("uploaded_at", { ascending: false });
+    if (error) return [];
+    return (data || []).map(mapRecordRow);
+  }
+  // Fallback: iterate map
+  const patient = patientsMap.get(key);
+  if (!patient) return [];
+  return patient.records.map((id) => recordsMap.get(id)).filter(Boolean);
+}
+
+function mapRecordRow(data) {
+  return {
+    id: data.id,
+    patientWallet: data.patient_wallet,
+    fileName: data.file_name,
+    documentType: data.document_type,
+    ipfsCid: data.ipfs_cid,
+    documentHash: data.document_hash,
+    hcsTopicId: data.hcs_topic_id,
+    hcsSequenceNumber: data.hcs_sequence_number,
+    verificationStatus: data.verification_status,
+    verifiedBy: data.verified_by,
+    isListed: data.is_listed,
+    listingPrice: parseFloat(data.listing_price) || 0,
+    uploadedAt: data.uploaded_at,
+  };
+}
 
 /**
  * POST /api/patient/register
@@ -25,7 +141,8 @@ router.post("/register", async (req, res) => {
       return res.status(400).json({ error: "Wallet address and name required" });
     }
 
-    if (patients.has(walletAddress.toLowerCase())) {
+    const existing = await getPatient(walletAddress);
+    if (existing) {
       return res.status(409).json({ error: "Patient already registered" });
     }
 
@@ -47,7 +164,7 @@ router.post("/register", async (req, res) => {
       mock,
     };
 
-    patients.set(walletAddress.toLowerCase(), patient);
+    await upsertPatient(patient);
 
     res.status(201).json({
       id: patient.id,
@@ -76,7 +193,7 @@ router.post("/upload", upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "Wallet address and file required" });
     }
 
-    const patient = patients.get(walletAddress.toLowerCase());
+    const patient = await getPatient(walletAddress);
     if (!patient) {
       return res.status(404).json({ error: "Patient not registered" });
     }
@@ -123,8 +240,12 @@ router.post("/upload", upload.single("file"), async (req, res) => {
       uploadedAt: new Date().toISOString(),
     };
 
-    records.set(record.id, record);
-    patient.records.push(record.id);
+    await insertRecord(record);
+
+    // Also update in-memory fallback if using it
+    if (!supabase && patientsMap.has(walletAddress.toLowerCase())) {
+      patientsMap.get(walletAddress.toLowerCase()).records.push(record.id);
+    }
 
     res.status(201).json({
       id: record.id,
@@ -146,28 +267,27 @@ router.post("/upload", upload.single("file"), async (req, res) => {
  * GET /api/patient/records/:walletAddress
  * Get all records for a patient
  */
-router.get("/records/:walletAddress", (req, res) => {
-  const patient = patients.get(req.params.walletAddress.toLowerCase());
+router.get("/records/:walletAddress", async (req, res) => {
+  const patient = await getPatient(req.params.walletAddress);
   if (!patient) {
     return res.status(404).json({ error: "Patient not found" });
   }
 
-  const patientRecords = patient.records.map((id) => {
-    const r = records.get(id);
-    return {
-      id: r.id,
-      fileName: r.fileName,
-      documentType: r.documentType,
-      description: r.description,
-      ipfsCid: r.ipfsCid,
-      verificationStatus: r.verificationStatus,
-      verifiedBy: r.verifiedBy,
-      attestationResult: r.attestationResult,
-      isListed: r.isListed,
-      listingPrice: r.listingPrice,
-      uploadedAt: r.uploadedAt,
-    };
-  });
+  const patientRecords = await getPatientRecordsFromDB(req.params.walletAddress);
+
+  const recordsList = patientRecords.map((r) => ({
+    id: r.id,
+    fileName: r.fileName,
+    documentType: r.documentType,
+    description: r.description,
+    ipfsCid: r.ipfsCid,
+    verificationStatus: r.verificationStatus,
+    verifiedBy: r.verifiedBy,
+    attestationResult: r.attestationResult,
+    isListed: r.isListed,
+    listingPrice: r.listingPrice,
+    uploadedAt: r.uploadedAt,
+  }));
 
   res.json({
     patient: {
@@ -175,33 +295,36 @@ router.get("/records/:walletAddress", (req, res) => {
       did: patient.did,
       walletAddress: patient.walletAddress,
       earnings: patient.earnings,
+      hcsTopicId: patient.hcsTopicId,
     },
-    records: patientRecords,
+    records: recordsList,
   });
 });
 
 /**
  * GET /api/patient/profile/:walletAddress
  */
-router.get("/profile/:walletAddress", (req, res) => {
-  const patient = patients.get(req.params.walletAddress.toLowerCase());
+router.get("/profile/:walletAddress", async (req, res) => {
+  const patient = await getPatient(req.params.walletAddress);
   if (!patient) {
     return res.status(404).json({ error: "Patient not found" });
   }
+
+  const patientRecords = await getPatientRecordsFromDB(req.params.walletAddress);
 
   res.json({
     name: patient.name,
     walletAddress: patient.walletAddress,
     did: patient.did,
     hcsTopicId: patient.hcsTopicId,
-    totalRecords: patient.records.length,
+    totalRecords: patientRecords.length,
     earnings: patient.earnings,
     registeredAt: patient.registeredAt,
   });
 });
 
-// Export records map for other routes
-router.records = records;
-router.patients = patients;
+// Export records map for other routes (fallback)
+router.records = recordsMap;
+router.patients = patientsMap;
 
 module.exports = router;
