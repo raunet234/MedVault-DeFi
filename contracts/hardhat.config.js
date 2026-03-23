@@ -19,6 +19,9 @@ module.exports = {
         ? [process.env.HEDERA_PRIVATE_KEY]
         : [],
       chainId: 296,
+      gas: 4_000_000,
+      gasPrice: 2_000_000_000_000,
+      timeout: 120_000,
     },
     localhost: {
       url: "http://127.0.0.1:8545",
