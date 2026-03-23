@@ -61,12 +61,12 @@ export default function LandingPage() {
 
         <div className="hero-stats animate-in animate-delay-3">
           <div className="hero-stat">
-            <div className="value">10,000+</div>
-            <div className="label">Records Verified</div>
+            <div className="value">4</div>
+            <div className="label">Test Records Anchored</div>
           </div>
           <div className="hero-stat">
-            <div className="value">500+</div>
-            <div className="label">Trusted Doctors</div>
+            <div className="value">3</div>
+            <div className="label">Hedera Services Used</div>
           </div>
           <div className="hero-stat">
             <div className="value">3-5s</div>
@@ -76,6 +76,9 @@ export default function LandingPage() {
             <div className="value">$0.001</div>
             <div className="label">Avg. Tx Fee</div>
           </div>
+          <span className="badge badge-teal" style={{ marginLeft: 12, alignSelf: 'center' }}>
+            🟢 Live on Hedera Testnet
+          </span>
         </div>
       </section>
 
